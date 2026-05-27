@@ -2,6 +2,7 @@ import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { isDevBlocked, getBlockedDevs } from "../dev-blocklist.js";
 import { log } from "../logger.js";
+import { batchValidate } from "../hardRules.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -196,6 +197,13 @@ export async function discoverPools({
 /**
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
+ * 
+ * Hybrid Screening Flow:
+ * 1. Fetch raw candidates from Meteora API
+ * 2. Apply blacklist filters (token/dev)
+ * 3. Enrich with OKX data (sniper, bundler, insider, dev status)
+ * 4. Apply HARD RULES validation (GMGN/OKX security checks)
+ * 5. Return only pools that pass ALL hard rules for LLM evaluation
  */
 export async function getTopCandidates({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
@@ -207,7 +215,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 
-  const eligible = pools
+  let eligible = pools
     .filter((p) => !occupiedPools.has(p.pool) && !occupiedMints.has(p.base?.mint))
     .slice(0, limit);
 
@@ -262,6 +270,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].dev_sold_all    = adv.dev_sold_all;
         eligible[i].dex_boost       = adv.dex_boost;
         eligible[i].dex_screener_paid = adv.dex_screener_paid;
+        eligible[i].total_fees_sol  = adv.total_fee_sol;      // Add global fees for hard rules
+        eligible[i].dev_rug_count   = adv.dev_rug_count;      // Add dev rug count for hard rules
+        eligible[i].dev_token_count = adv.dev_token_count;    // Add dev token count for hard rules
         if (adv.creator && !eligible[i].dev) eligible[i].dev = adv.creator;
       }
       if (risk) {
@@ -312,6 +323,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     });
     eligible.splice(0, eligible.length, ...filtered);
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
+  }
+
+  // ========== HYBRID FILTER: Apply Hard Rules Validation ==========
+  // This is the critical security layer that prevents LLM from seeing unsafe pools
+  if (eligible.length > 0) {
+    log("screening", `Running hard rules validation on ${eligible.length} candidate(s)...`);
+    eligible = await batchValidate(eligible);
+    log("screening", `${eligible.length} pool(s) passed hard rules and are eligible for LLM evaluation`);
   }
 
   return {
