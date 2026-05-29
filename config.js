@@ -68,6 +68,11 @@ export const config = {
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
+    // Fib Retracement Strategy Settings
+    fibEntryTop:           u.fibEntryTop           ?? 0.5,   // 50% Fib (top of liquidity range)
+    fibEntryBottom:        u.fibEntryBottom        ?? 0.786, // 78.6% Fib (bottom of liquidity range)
+    targetProfitPercent:   u.targetProfitPercent   ?? 2.0,   // Take profit at 2% gain
+    stopLossBelowRange:    u.stopLossBelowRange    ?? true,  // Cut loss when candle closes below range bottom
     // Trailing take-profit
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,    // activate trailing at X% PnL

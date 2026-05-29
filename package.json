@@ -19,6 +19,7 @@
     "@meteora-ag/dlmm": "latest",
     "@solana/spl-token": "^0.3.11",
     "@solana/web3.js": "^1.95.0",
+    "axios": "^1.16.1",
     "bn.js": "^5.2.1",
     "bs58": "^5.0.0",
     "dotenv": "^17.3.1",
