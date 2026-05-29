@@ -1,10 +1,11 @@
 /**
  * DLMM Position Manager - Fib Retracement Strategy
  * Handles entry, monitoring, and exit for single-side SOL liquidity positions
+ * Strategy: Bid-Ask Only (SOL side only), Entry at Fib 0.5-0.786, TP 2%, SL on candle close below range
  */
 
-import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 import { deployPosition, closePosition } from './dlmm.js';
+import { swapToken } from './wallet.js';
 import * as technicals from './technicals.js';
 import * as stateManager from '../state.js';
 import { config } from '../config.js';
@@ -12,6 +13,20 @@ import { config } from '../config.js';
 // Constants
 const TARGET_PROFIT_PERCENT = 2.0; // 2% profit target
 const STOP_LOSS_TRIGGER = 'CLOSE_BELOW_RANGE'; // Cut loss when 5m candle closes below range bottom
+
+/**
+ * Wrapper function for swapping tokens to SOL
+ * @param {Object} params - Swap parameters
+ * @returns {Promise<Object>} - Swap result
+ */
+async function swapToSOL({ inputMint, amount, slippageBps = 200 }) {
+    return await swapToken({
+        input_mint: inputMint,
+        output_mint: 'So11111111111111111111111111111111111111112', // SOL native mint
+        amount: amount,
+        slippage_bps: slippageBps
+    });
+}
 
 /**
  * Calculate DLMM Bin Range from Fibonacci levels
@@ -60,62 +75,71 @@ function shouldEntry(setup) {
 }
 
 /**
- * Execute Entry - Deploy Single-Side SOL Liquidity
+ * Execute Entry - Deploy Single-Side SOL Liquidity (Bid-Ask Mode)
  * @param {string} poolAddress - DLMM pool address
  * @param {Object} setup - Technical analysis setup
- * @param {Keypair} wallet - Wallet keypair
- * @param {Connection} connection - Solana connection
  * @returns {Promise<Object>} - Position details or null
  */
-async function executeEntry(poolAddress, setup, wallet, connection) {
+async function executeEntry(poolAddress, setup) {
     console.log(`[PositionManager] Executing entry for ${poolAddress}...`);
     
     try {
-        const pool = await getPool(poolAddress);
-        if (!pool) {
-            throw new Error('Pool not found');
-        }
-        
-        // Calculate bin range
+        // Calculate bin range from Fib levels
         const binConfig = calculateBinRangeFromFib(setup.fibLevels, setup.currentPrice);
         
         // Determine capital allocation (from config or LLM recommendation)
         const capitalAmount = config.DEFAULT_POSITION_SIZE_SOL || 0.5; // Default 0.5 SOL
         
-        console.log(`[PositionManager] Deploying ${capitalAmount} SOL in bins ${binConfig.idealLowerBin} to ${binConfig.idealUpperBin}`);
+        console.log(`[PositionManager] Deploying ${capitalAmount} SOL in Bid-Ask mode`);
+        console.log(`[PositionManager] Entry Zone: $${setup.fibLevels.rangeBottom.toFixed(8)} - $${setup.fibLevels.rangeTop.toFixed(8)}`);
         
-        // Create position (single-sided SOL)
-        const positionTx = await createPosition({
-            poolAddress,
-            owner: wallet,
-            lowerBinId: binConfig.idealLowerBin,
-            upperBinId: binConfig.idealUpperBin,
-            amountX: capitalAmount, // SOL amount
-            amountY: 0,             // No token side (single-sided)
-            connection
+        // Deploy position with strategy='bid_ask' and amount_y=SOL, amount_x=0
+        // This creates single-sided SOL liquidity
+        const result = await deployPosition({
+            pool_address: poolAddress,
+            amount_y: capitalAmount,  // SOL side (Y token in Meteora is typically SOL)
+            amount_x: 0,              // No base token (single-sided)
+            strategy: 'bid_ask',      // Bid-Ask only mode
+            bins_below: binConfig.estimatedBinCount,
+            bins_above: 0             // No bins above (pure bid side)
         });
         
-        if (!positionTx) {
-            throw new Error('Failed to create position');
+        if (!result || !result.success) {
+            throw new Error(result?.error || 'Failed to create position');
         }
         
         const positionData = {
             poolAddress,
             tokenAddress: setup.tokenAddress,
-            positionId: positionTx.positionId,
+            positionId: result.position,
             entryPrice: setup.currentPrice,
             fibLevels: setup.fibLevels,
             rangeTop: setup.fibLevels.rangeTop,
             rangeBottom: setup.fibLevels.rangeBottom,
             capitalSol: capitalAmount,
             createdAt: Date.now(),
-            status: 'ACTIVE'
+            status: 'ACTIVE',
+            strategy: 'bid_ask',
+            txHash: result.txs?.[0]
         };
         
         // Save to state
-        await stateManager.addPosition(positionData);
+        await stateManager.trackPosition({
+            position: positionData.positionId,
+            pool: poolAddress,
+            pool_name: setup.tokenAddress,
+            strategy: 'bid_ask',
+            bin_range: { 
+                min: result.bin_range?.min, 
+                max: result.bin_range?.max, 
+                active: result.bin_range?.active 
+            },
+            amount_sol: capitalAmount,
+            initial_value_usd: capitalAmount * setup.currentPrice // Approximate
+        });
         
-        console.log(`[PositionManager] Entry successful! Position ID: ${positionTx.positionId}`);
+        console.log(`[PositionManager] Entry successful! Position ID: ${positionData.positionId}`);
+        console.log(`[PositionManager] Tx Hash: ${positionData.txHash}`);
         
         return positionData;
         
@@ -128,12 +152,11 @@ async function executeEntry(poolAddress, setup, wallet, connection) {
 /**
  * Monitor Position for Exit Conditions
  * @param {Object} position - Position data from state
- * @param {Connection} connection - Solana connection
  * @returns {Promise<Object>} - { action: 'HOLD' | 'TAKE_PROFIT' | 'STOP_LOSS', reason: string }
  */
-async function monitorPosition(position, connection) {
+async function monitorPosition(position) {
     try {
-        // Fetch current price
+        // Fetch current price and candles
         const setup = await technicals.analyzeSetup(position.tokenAddress);
         if (!setup) {
             console.log(`[PositionManager] Cannot fetch price for ${position.tokenAddress}, holding...`);
@@ -197,59 +220,62 @@ async function monitorPosition(position, connection) {
  * Execute Exit - Withdraw Liquidity and Swap to SOL
  * @param {Object} position - Position data
  * @param {string} action - 'TAKE_PROFIT' or 'STOP_LOSS'
- * @param {Keypair} wallet - Wallet keypair
- * @param {Connection} connection - Solana connection
  * @returns {Promise<boolean>} - Success status
  */
-async function executeExit(position, action, wallet, connection) {
+async function executeExit(position, action) {
     console.log(`[PositionManager] Executing ${action} for position ${position.positionId}...`);
     
     try {
-        // Withdraw liquidity
-        const withdrawResult = await withdrawPosition({
-            poolAddress: position.poolAddress,
-            positionId: position.positionId,
-            owner: wallet,
-            connection
+        // Close position (withdraws both SOL and token)
+        const closeResult = await closePosition({
+            position_address: position.positionId,
+            pool_address: position.poolAddress
         });
         
-        if (!withdrawResult) {
-            throw new Error('Failed to withdraw position');
+        if (!closeResult || !closeResult.success) {
+            throw new Error(closeResult?.error || 'Failed to close position');
         }
         
-        const { receivedSOL, receivedToken } = withdrawResult;
+        const { receivedSol, receivedToken, tokenAmount } = closeResult;
         
-        console.log(`[PositionManager] Withdrawn: ${receivedSOL} SOL, ${receivedToken.amount} tokens`);
+        console.log(`[PositionManager] Closed position. Received: ${receivedSol} SOL, ${tokenAmount} tokens`);
         
-        // Swap received tokens back to SOL (if any)
-        let totalSOL = receivedSOL;
-        if (receivedToken && receivedToken.amount > 0) {
-            console.log(`[PositionManager] Swapping ${receivedToken.amount} tokens to SOL...`);
-            const swapResult = await swapToken({
+        // CRITICAL: Auto-swap all received tokens to SOL immediately
+        let totalSOL = receivedSol;
+        if (tokenAmount && tokenAmount > 0) {
+            console.log(`[PositionManager] AUTO-SWAPPING ${tokenAmount} tokens to SOL...`);
+            
+            const swapResult = await swapToSOL({
                 inputMint: position.tokenAddress,
-                outputMint: 'So11111111111111111111111111111111111111112', // SOL
-                amount: receivedToken.amount,
-                owner: wallet,
-                connection
+                amount: tokenAmount,
+                slippageBps: 200 // 2% slippage for emergency exit
             });
             
-            if (swapResult) {
+            if (swapResult && swapResult.success) {
                 totalSOL += swapResult.outputAmount;
-                console.log(`[PositionManager] Swap successful: +${swapResult.outputAmount} SOL`);
+                console.log(`[PositionManager] Swap successful: +${swapResult.outputAmount.toFixed(6)} SOL`);
+                console.log(`[PositionManager] Total SOL returned: ${totalSOL.toFixed(6)}`);
+            } else {
+                console.error(`[PositionManager] Swap failed: ${swapResult?.error || 'Unknown error'}`);
+                // Don't fail the entire exit if swap fails, but log it
             }
         }
         
-        // Update position status
-        await stateManager.updatePosition(position.positionId, {
-            status: 'CLOSED',
-            exitAction: action,
-            exitPrice: position.currentPrice,
-            totalSOLReturned: totalSOL,
-            closedAt: Date.now()
+        // Calculate final PnL
+        const pnl = ((totalSOL - position.capitalSol) / position.capitalSol) * 100;
+        
+        // Update position status in state
+        await stateManager.recordClose({
+            position: position.positionId,
+            pool: position.poolAddress,
+            action: action,
+            pnl_usd: (totalSOL - position.capitalSol) * position.entryPrice, // Approximate
+            pnl_pct: pnl,
+            total_sol_returned: totalSOL,
+            closed_at: Date.now()
         });
         
-        const pnl = ((totalSOL - position.capitalSol) / position.capitalSol) * 100;
-        console.log(`[PositionManager] Position closed. Total SOL: ${totalSOL}, PnL: ${pnl.toFixed(2)}%`);
+        console.log(`[PositionManager] Position closed. Action: ${action}, PnL: ${pnl.toFixed(2)}%`);
         
         return true;
         
@@ -261,10 +287,8 @@ async function executeExit(position, action, wallet, connection) {
 
 /**
  * Main management loop for all active positions
- * @param {Keypair} wallet - Wallet keypair
- * @param {Connection} connection - Solana connection
  */
-async function manageAllPositions(wallet, connection) {
+async function manageAllPositions() {
     console.log('[PositionManager] Starting position management cycle...');
     
     const activePositions = await stateManager.getActivePositions();
@@ -277,11 +301,11 @@ async function manageAllPositions(wallet, connection) {
     for (const position of activePositions) {
         console.log(`\n[PositionManager] Checking position ${position.positionId}...`);
         
-        const decision = await monitorPosition(position, connection);
+        const decision = await monitorPosition(position);
         console.log(`[PositionManager] Decision: ${decision.action} - ${decision.reason}`);
         
         if (decision.action === 'TAKE_PROFIT' || decision.action === 'STOP_LOSS') {
-            const success = await executeExit(position, decision.action, wallet, connection);
+            const success = await executeExit(position, decision.action);
             
             if (success) {
                 console.log(`[PositionManager] Successfully closed position ${position.positionId}`);
