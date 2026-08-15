@@ -7,6 +7,7 @@
  */
 
 import cron from "node-cron";
+import { createSchedulerState } from "./scheduler-state.js";
 
 function safeInterval(value, fallback = 1) {
   const n = Number(value);
@@ -25,58 +26,58 @@ export function createScheduler({
   onPnlPoll,
   onScheduleStart,
   logger = () => {},
+  state = createSchedulerState(),
 }) {
   if (typeof onManagement !== "function") throw new TypeError("onManagement is required");
   if (typeof onScreening !== "function") throw new TypeError("onScreening is required");
 
   let tasks = [];
   let pnlTimer = null;
-  let started = false;
-  let managementBusy = false;
-  let screeningBusy = false;
-  let pnlPollBusy = false;
 
   const managementMin = safeInterval(managementIntervalMin);
   const screeningMin = safeInterval(screeningIntervalMin);
   const healthMin = safeInterval(healthCheckIntervalMin, 60);
 
   async function guardedManagement(source = "cron") {
-    if (managementBusy) return null;
-    managementBusy = true;
+    if (state.isManagementBusy()) return null;
+    state.setManagementBusy(true);
+    state.markManagementRun();
     try {
       return await onManagement({ source });
     } finally {
-      managementBusy = false;
+      state.setManagementBusy(false);
     }
   }
 
   async function guardedScreening(source = "cron") {
-    if (screeningBusy) return null;
-    screeningBusy = true;
+    if (state.isScreeningBusy()) return null;
+    state.setScreeningBusy(true);
+    state.markScreeningRun();
     try {
       return await onScreening({ source });
     } finally {
-      screeningBusy = false;
+      state.setScreeningBusy(false);
     }
   }
 
   async function guardedHealth() {
-    if (managementBusy) return null;
-    managementBusy = true;
+    if (state.isManagementBusy()) return null;
+    state.setManagementBusy(true);
     try {
       return await onHealth?.();
     } finally {
-      managementBusy = false;
+      state.setManagementBusy(false);
     }
   }
 
   async function guardedPnlPoll() {
-    if (managementBusy || screeningBusy || pnlPollBusy || !onPnlPoll) return null;
-    pnlPollBusy = true;
+    if (state.isManagementBusy() || state.isScreeningBusy() || state.isPnlPollBusy() || !onPnlPoll) return null;
+    state.setPnlPollBusy(true);
+    state.markPollTriggered();
     try {
       return await onPnlPoll();
     } finally {
-      pnlPollBusy = false;
+      state.setPnlPollBusy(false);
     }
   }
 
@@ -85,7 +86,7 @@ export function createScheduler({
     tasks = [];
     if (pnlTimer) clearInterval(pnlTimer);
     pnlTimer = null;
-    started = false;
+    state.reset();
     logger("cron", "Scheduler stopped");
   }
 
@@ -113,7 +114,7 @@ export function createScheduler({
       pnlTimer = setInterval(() => guardedPnlPoll(), 30_000);
     }
 
-    started = true;
+    state.setStarted(true);
     onScheduleStart?.({ managementMin, screeningMin, healthMin });
     logger("cron", `Scheduler started — management every ${managementMin}m, screening every ${screeningMin}m`);
   }
@@ -121,9 +122,10 @@ export function createScheduler({
   return {
     start,
     stop,
-    isStarted: () => started,
-    isManagementBusy: () => managementBusy,
-    isScreeningBusy: () => screeningBusy,
+    isStarted: () => state.isStarted(),
+    isManagementBusy: () => state.isManagementBusy(),
+    isScreeningBusy: () => state.isScreeningBusy(),
     getIntervals: () => ({ managementMin, screeningMin, healthMin }),
+    getState: () => state,
   };
 }
