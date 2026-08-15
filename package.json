@@ -14,11 +14,13 @@
     "test:screen": "node test/test-screening.js",
     "test:agent": "DRY_RUN=true node test/test-agent.js",
     "test:domain": "node test/test-domain-contracts.js",
+    "test:config": "node test/test-config-v2.js",
     "postinstall": "node scripts/patch-anchor.js"
   },
   "dependencies": {
     "@meteora-ag/dlmm": "latest",
     "@solana/spl-token": "^0.3.11",
+    "@solana/web3.js": "^1.95.0",
     "bn.js": "^5.2.1",
     "bs58": "^5.0.0",
     "dotenv": "^17.3.1",
