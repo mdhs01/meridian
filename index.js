@@ -16,6 +16,8 @@ import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { createScheduler } from "./app/scheduler.js";
+import { createRuntimeAdapter } from "./app/runtime.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -59,6 +61,8 @@ let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 let _pollTriggeredAt = 0; // epoch ms — cooldown for poller-triggered management
+
+let scheduler = null;
 
 /** Strip <think>...</think> reasoning blocks that some models leak into output */
 function stripThink(text) {
@@ -326,6 +330,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = false;
     return null;
   }
+
   timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
   let screenReport = null;
@@ -403,9 +408,9 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const okxParts = [
         pool.risk_level     != null ? `risk=${pool.risk_level}`               : null,
         pool.bundle_pct     != null ? `bundle=${pool.bundle_pct}%`            : null,
-        pool.sniper_pct     != null ? `sniper=${pool.sniper_pct}%`            : null,
-        pool.suspicious_pct != null ? `suspicious=${pool.suspicious_pct}%`    : null,
-        pool.new_wallet_pct != null ? `new_wallets=${pool.new_wallet_pct}%`   : null,
+        pool.sniper_pct     != null ? `sniper=${pool.sniper_pct}%`             : null,
+        pool.suspicious_pct != null ? `suspicious=${pool.suspicious_pct}%`     : null,
+        pool.new_wallet_pct != null ? `new_wallets=${pool.new_wallet_pct}%`    : null,
         pool.is_rugpull != null ? `rugpull=${pool.is_rugpull ? "YES" : "NO"}` : null,
         pool.is_wash != null ? `wash=${pool.is_wash ? "YES" : "NO"}` : null,
       ].filter(Boolean).join(", ");
@@ -478,7 +483,77 @@ STEPS:
   return screenReport;
 }
 
+function runHealthCheck() {
+  log("cron", "Starting health check");
+  return agentLoop(`
+HEALTH CHECK
+
+Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
+      `, config.llm.maxSteps, [], "MANAGER")
+    .catch((error) => {
+      log("cron_error", `Health check failed: ${error.message}`);
+    });
+}
+
+async function runPnlPoll() {
+  const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
+  if (!result?.positions?.length) return;
+
+  for (const p of result.positions) {
+    const exit = updatePnlAndCheckExits(p.position, p, config.management);
+    if (!exit) continue;
+
+    const cooldownMs = config.schedule.managementIntervalMin * 60 * 1000;
+    const sinceLastTrigger = Date.now() - _pollTriggeredAt;
+
+    if (sinceLastTrigger >= cooldownMs) {
+      _pollTriggeredAt = Date.now();
+      log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — triggering management`);
+      runManagementCycle({ silent: true }).catch((e) =>
+        log("cron_error", `Poll-triggered management failed: ${e.message}`),
+      );
+    } else {
+      log("state", `[PnL poll] Exit alert: ${p.pair} — ${exit.reason} — cooldown (${Math.round((cooldownMs - sinceLastTrigger) / 1000)}s left)`);
+    }
+    break;
+  }
+}
+
+function ensureScheduler() {
+  if (scheduler) return scheduler;
+
+  const runtime = createRuntimeAdapter({
+    runManagement: ({ source } = {}) => runManagementCycle({ source }),
+    runScreening: ({ source } = {}) => runScreeningCycle({ source }),
+    runHealth: runHealthCheck,
+    runBriefing,
+    runBriefingWatchdog: maybeRunMissedBriefing,
+    runPnlPoll,
+  });
+
+  scheduler = createScheduler({
+    managementIntervalMin: config.schedule.managementIntervalMin,
+    screeningIntervalMin: config.schedule.screeningIntervalMin,
+    healthCheckIntervalMin: 60,
+    ...runtime,
+    onScheduleStart: ({ managementMin, screeningMin }) => {
+      log("cron", `Scheduler wiring active — management every ${managementMin}m, screening every ${screeningMin}m`);
+    },
+    logger: log,
+  });
+
+  return scheduler;
+}
+
+/**
+ * Phase 3A.3: entrypoint wiring only. Legacy cron implementation remains
+ * available as startLegacyCronJobs until Phase 3A.4 regression verification.
+ */
 export function startCronJobs() {
+  ensureScheduler().start();
+}
+
+function startLegacyCronJobs() {
   stopCronJobs(); // stop any running tasks before (re)starting
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
@@ -555,6 +630,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
 // ═══════════════════════════════════════════
 async function shutdown(signal) {
   log("shutdown", `Received ${signal}. Shutting down...`);
+  scheduler?.stop();
   stopPolling();
   const positions = await getMyPositions();
   log("shutdown", `Open positions at shutdown: ${positions.total_positions}`);
@@ -900,7 +976,7 @@ Commands:
       console.log(`  minTokenFeesSol:      ${s.minTokenFeesSol}`);
       console.log(`  maxBundlePct:         ${s.maxBundlePct}`);
       console.log(`  maxBotHoldersPct:     ${s.maxBotHoldersPct}`);
-      console.log(`  maxTop10Pct:          ${s.maxTop10Pct}`);
+      console.log(`  maxTop10Pct:           ${s.maxTop10Pct}`);
       console.log(`  timeframe:            ${s.timeframe}`);
       const perf = getPerformanceSummary();
       if (perf) {
