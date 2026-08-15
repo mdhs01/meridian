@@ -16,6 +16,9 @@ The scheduler owns:
 - briefing scheduling
 - briefing watchdog scheduling
 - lightweight PnL polling scheduling
+- scheduler runtime state
+
+Scheduler runtime state is isolated in `app/scheduler-state.js` and contains only scheduling/lifecycle markers. It does not contain positions, strategy state, or trading decisions.
 
 The scheduler does **not** own:
 
@@ -40,6 +43,25 @@ Those are injected as callbacks.
 
 Trading logic remains outside the lifecycle service.
 
+## Phase 3A.1 — Runtime adapter
+
+`app/runtime.js` provides the callback boundary between Meridian cycle implementations and infrastructure services. It does not implement management, screening, or trading logic.
+
+## Phase 3A.2 — Scheduler state
+
+`app/scheduler-state.js` extracts mutable scheduling state into a per-scheduler state object. The state tracks:
+
+- started/stopped status
+- management busy flag
+- screening busy flag
+- PnL poll busy flag
+- management last-run timestamp
+- screening last-run timestamp
+- screening trigger timestamp
+- PnL trigger timestamp
+
+The legacy `index.js` still owns its existing copies during the migration. They are intentionally not deleted until Phase 3A.3/3A.4 wiring and regression verification are complete.
+
 ## Compatibility rule
 
 The legacy `index.js` remains the active entrypoint during the migration. Phase 3 introduces the isolated services first; wiring them into the legacy entrypoint is a separate migration step so scheduler extraction cannot silently change trading behavior.
@@ -49,11 +71,15 @@ The legacy `index.js` remains the active entrypoint during the migration. Phase 
 ```text
 index/bootstrap
       |
-      +--> scheduler --> management callback
-      |             --> screening callback
-      |             --> health callback
-      |             --> briefing callback
-      |             --> PnL poll callback
+      +--> runtime adapter
+                |
+                +--> scheduler --> management callback
+                |             --> screening callback
+                |             --> health callback
+                |             --> briefing callback
+                |             --> PnL poll callback
+                |
+                +--> scheduler-state
       |
       +--> lifecycle --> scheduler.stop()
                     --> polling.stop()
